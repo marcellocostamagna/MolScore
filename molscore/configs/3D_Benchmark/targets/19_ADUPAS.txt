@@ -1,0 +1,1 @@
+ADUPAS:CC12=C[Ir]3451(C=C23)c1c(C[P]4(C(F)(F)F)C(F)(F)F)cccc1C[P]5(C(F)(F)F)C(F)(F)F

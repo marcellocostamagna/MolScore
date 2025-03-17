@@ -1,0 +1,1 @@
+XIDTOW:CC1=N2CCCN3=Cc4c(O[Cu]23Oc2ccccc12)ccc1ccccc41

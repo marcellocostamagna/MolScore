@@ -1,0 +1,1 @@
+EGEYOG:CC([NH2][Pt]1([NH2]C(C)c2ccccc12)N=C=O)c1ccccc1

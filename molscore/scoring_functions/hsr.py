@@ -12,6 +12,9 @@ from hsr import pre_processing as pp
 from hsr import fingerprint as fp
 from hsr import similarity as sim
 from hsr.utils import PROTON_FEATURES
+import importlib.resources as pkg_resources
+import molscore.configs
+
 
 logger = logging.getLogger("HSR")
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -20,6 +23,8 @@ ch = logging.StreamHandler()
 ch.setLevel(logging.INFO)
 logger.addHandler(ch)
 
+MOLSCORE_PATH = str(pkg_resources.files(molscore.configs))
+    
 def import_ccdc():
     """
     Safely imports required modules from the CCDC library, handles exceptions, and returns None if import fails.
@@ -94,29 +99,127 @@ class HSR:
         """
         
         self.prefix = prefix.strip().replace(" ", "_")
-        
         self.generator = generator
         self.n_jobs = n_jobs
         self.timeout = timeout
         self.save_files = save_files
+        
         if self.generator == 'ccdc':
             self.io, self.conformer, self.ccdcMolecule = import_ccdc()
-            #Read molecule from file 
-            ref_mol = self.io.MoleculeReader(ref_molecule)[0]
-            ref_mol_array = get_array_from_ccdcmol(ref_mol)
-            self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
+        
+        # Resolve absolute or relative paths
+        if isinstance(ref_molecule, str):
+            if os.path.isabs(ref_molecule):
+                self.ref_molecule_path = ref_molecule  # Absolute path, use directly
+            else:
+                self.ref_molecule_path = os.path.join(MOLSCORE_PATH, ref_molecule)  # Resolve relative path
+        else:
+            self.ref_molecule_path = ref_molecule  # Keep as is if not a string
+
+        # Check if ref_molecule exists and determine initialization method
+        if isinstance(ref_molecule, str) and os.path.exists(self.ref_molecule_path):
+            if self.ref_molecule_path.endswith(".txt"):
+                self._initialize_from_txt(self.ref_molecule_path)  # Handle Benchmark case
+            else:
+                self._initialize_from_3d_file(self.ref_molecule_path)  # Handle 3D molecule file
+        elif isinstance(ref_molecule, str) and ":" in ref_molecule:
+            # If the input contains ":", assume it's a SMILES (SMILES can't be a valid file path)
+            self._initialize_from_smiles(ref_molecule)
+        elif isinstance(ref_molecule, str) and not os.path.exists(self.ref_molecule_path):
+            raise FileNotFoundError(
+                f"Reference molecule file '{self.ref_molecule_path}' does not exist."
+            )
+        else:
+            # Provide detailed error message based on issue type
+            if not isinstance(ref_molecule, (str, os.PathLike)):
+                raise TypeError(
+                    f"Reference molecule must be a string (SMILES or file path) or a valid file path. Got: {type(ref_molecule)}"
+                )
+            elif self.generator not in ["rdkit", "obabel", "ccdc", "None"]:
+                raise ValueError(
+                    f"Invalid generator '{self.generator}'. Supported options: 'rdkit', 'obabel', 'ccdc', or 'None'."
+                )
+            else:
+                raise ValueError(
+                    f"Reference molecule '{ref_molecule}' is not recognized. "
+                    "Ensure it is a valid SMILES, a properly formatted .txt benchmark file, or a supported 3D file (.sdf, .mol, .pdb, etc.)."
+                )
+                
+    def _initialize_from_smiles(self, smiles):
+        if self.generator == 'ccdc':
+            raise ValueError("CCDC generator does not support SMILES input directly.")
         elif self.generator == 'obabel':
-            #Read molecule from file (sdf)
-            ref_mol = next(pb.readfile("sdf", ref_molecule))
+            ref_mol = pb.readstring("smi", smiles)
+            ref_mol.addh()
+            ref_mol.make3D()
+            ref_mol.localopt()
             ref_mol_array = get_array_from_pybelmol(ref_mol)
-            self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
-        elif self.generator == 'rdkit' or self.generator == 'None':
-            self.ref_molecule = pp.read_mol_from_file(ref_molecule)
-            if self.ref_molecule is None:
-                raise ValueError("Reference molecule is None. Check if the extension of the file is managed by HSR")
-            self.ref_mol_fp = fp.generate_fingerprint_from_molecule(self.ref_molecule, PROTON_FEATURES)
-        else:   
-            raise ValueError(f"Generator '{self.generator}' not supported. Please choose between 'rdkit', 'obabel', 'ccdc' or 'None'")
+        else:  # RDKit
+            mol = Chem.MolFromSmiles(smiles)
+            mol = Chem.AddHs(mol)
+            Chem.AllChem.EmbedMolecule(mol)
+            Chem.AllChem.MMFFOptimizeMolecule(mol)
+            ref_mol_array = fp.generate_fingerprint_from_molecule(mol, PROTON_FEATURES)
+        
+        self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
+    
+    def _initialize_from_txt(self, txt_file):
+        with open(txt_file, 'r') as f:
+            csd_entry, smiles = f.readline().strip().split(":")
+        
+        if self.generator == 'ccdc':
+            ref_mol = self.io.MoleculeReader('CSD')[csd_entry]
+            ref_mol_array = get_array_from_ccdcmol(ref_mol)
+        elif self.generator == 'obabel':
+            ref_mol = pb.readstring("smi", smiles)
+            ref_mol.addh()
+            ref_mol.make3D()
+            ref_mol.localopt()
+            ref_mol_array = get_array_from_pybelmol(ref_mol)
+        else:  # RDKit
+            mol = Chem.MolFromSmiles(smiles)
+            mol = Chem.AddHs(mol)
+            Chem.AllChem.EmbedMolecule(mol)
+            Chem.AllChem.MMFFOptimizeMolecule(mol)
+            ref_mol_array = fp.generate_fingerprint_from_molecule(mol, PROTON_FEATURES)
+        
+        self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
+    
+    def _initialize_from_3d_file(self, file_path):
+        ext = os.path.splitext(file_path)[-1].lower()
+        
+        if self.generator == 'ccdc':
+            ref_mol = self.io.MoleculeReader(file_path)[0]
+            ref_mol_array = get_array_from_ccdcmol(ref_mol)
+        elif self.generator == 'obabel':
+            ref_mol = next(pb.readfile(ext[1:], file_path))
+            ref_mol_array = get_array_from_pybelmol(ref_mol)
+        else:  # RDKit
+            ref_mol = pp.read_mol_from_file(file_path)
+            if ref_mol is None:
+                raise ValueError("Invalid file format for RDKit parser.")
+            ref_mol_array = fp.generate_fingerprint_from_molecule(ref_mol, PROTON_FEATURES)
+        
+        self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
+        
+        # if self.generator == 'ccdc':
+        #     self.io, self.conformer, self.ccdcMolecule = import_ccdc()
+        #     #Read molecule from file 
+        #     ref_mol = self.io.MoleculeReader(ref_molecule)[0]
+        #     ref_mol_array = get_array_from_ccdcmol(ref_mol)
+        #     self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
+        # elif self.generator == 'obabel':
+        #     #Read molecule from file (sdf)
+        #     ref_mol = next(pb.readfile("sdf", ref_molecule))
+        #     ref_mol_array = get_array_from_pybelmol(ref_mol)
+        #     self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
+        # elif self.generator == 'rdkit' or self.generator == 'None':
+        #     self.ref_molecule = pp.read_mol_from_file(ref_molecule)
+        #     if self.ref_molecule is None:
+        #         raise ValueError("Reference molecule is None. Check if the extension of the file is managed by HSR")
+        #     self.ref_mol_fp = fp.generate_fingerprint_from_molecule(self.ref_molecule, PROTON_FEATURES)
+        # else:   
+        #     raise ValueError(f"Generator '{self.generator}' not supported. Please choose between 'rdkit', 'obabel', 'ccdc' or 'None'")
             
             
     def save_mols_to_file(self, results: dict, directory: str, file_names: list):
