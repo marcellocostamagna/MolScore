@@ -6,6 +6,7 @@ channels:
   - pytorch
   - nvidia
   - bioconda
+  - https://conda.ccdc.cam.ac.uk
 dependencies:
   - python>=3.8,<3.10
   - rdkit>=2019.03.2
@@ -20,6 +21,7 @@ dependencies:
   - pytorch::torchvision
   - pytorch::torchaudio
   - pytorch::pytorch-cuda>=11.6  # Version may need to change depending on NVIDIA drivers
+  - csd-python-api
   - pip
   - pip:
     - tqdm
