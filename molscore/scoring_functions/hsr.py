@@ -4,14 +4,13 @@ from typing import Union
 from openbabel import pybel as pb
 import numpy as np
 from functools import partial
-# from molscore.scoring_functions.utils import Pool
 import multiprocessing
 from multiprocessing import Pool
 from rdkit import Chem
 from hsr import pre_processing as pp
 from hsr import fingerprint as fp
 from hsr import similarity as sim
-from hsr.utils import PROTON_FEATURES
+from hsr.utils import PROTON_FEATURES, extract_proton_number, extract_formal_charge
 import importlib.resources as pkg_resources
 import molscore.configs
 
@@ -24,6 +23,11 @@ ch.setLevel(logging.INFO)
 logger.addHandler(ch)
 
 MOLSCORE_PATH = str(pkg_resources.files(molscore.configs))
+
+P_Q_FEATURES = {
+    'protons' : extract_proton_number,
+    'formal_charges' : extract_formal_charge
+    }
 
 def component_of_interest(molecule):
     components = molecule.components
@@ -80,26 +84,6 @@ def import_ccdc():
     # Return None for all if import fails
     return None, None, None
 
-def get_array_from_pybelmol(pybelmol):
-    # Iterate over the atoms in the molecule
-    atom_array = []
-    for atom in pybelmol.atoms:
-        # Append the coordinates and the atomic number of the atom (on each row)
-        atom_array.append([atom.coords[0], atom.coords[1], atom.coords[2], np.sqrt(atom.atomicnum)])   
-    # Centering the data
-    atom_array -= np.mean(atom_array, axis=0)
-    return atom_array
-
-def get_array_from_ccdcmol(ccdcmol):
-    # Iterate over the atoms in the molecule
-    atom_array = []
-    for atom in ccdcmol.atoms:
-        # Append the coordinates and the atomic number of the atom (on each row)
-        atom_array.append([atom.coordinates[0], atom.coordinates[1], atom.coordinates[2], np.sqrt(atom.atomic_number)])    
-    # Centering the data
-    atom_array -= np.mean(atom_array, axis=0)
-    return atom_array
-
 class HSR:
     """
     HSR (Hypershape Recognition) similarity method
@@ -114,7 +98,9 @@ class HSR:
         generator: str,  
         n_jobs: int = 1,    
         timeout: int = 10,
-        save_files: bool = False 
+        save_files: bool = False, 
+        use_charges_in_fp: bool = False
+
     ):
         """
         Initialize HSR similarity measure
@@ -125,6 +111,7 @@ class HSR:
         :param n_jobs: Number of parralel jobs (number of molecules to score in parallel)
         :param timeout: Timeout value for the 3D generation process (in seconds)
         :param save_files: Save the 3D coordinates of the molecules in a file
+        :param use_charges_in_fp: Considers also the formal charge of the atoms to construct the fingerprint
         """
         
         self.prefix = prefix.strip().replace(" ", "_")
@@ -132,6 +119,9 @@ class HSR:
         self.n_jobs = n_jobs
         self.timeout = timeout
         self.save_files = save_files
+        self.use_charges = use_charges_in_fp
+        self.feature_set = P_Q_FEATURES if self.use_charges else PROTON_FEATURES
+
         
         if self.generator == 'ccdc':
             self.io, self.conformer, self.ccdcMolecule = import_ccdc()
@@ -173,7 +163,28 @@ class HSR:
                     f"Reference molecule '{ref_molecule}' is not recognized. "
                     "Ensure it is a valid SMILES, a properly formatted .txt benchmark file, or a supported 3D file (.sdf, .mol, .pdb, etc.)."
                 )
-                
+    def get_array_from_ccdcmol(self, ccdcmol):
+        atom_array = []
+        for atom in ccdcmol.atoms:
+            coords = [atom.coordinates[0], atom.coordinates[1], atom.coordinates[2], np.sqrt(atom.atomic_number)]
+            if self.use_charges:
+                coords.append(atom.formal_charge)
+            atom_array.append(coords)
+        atom_array = np.array(atom_array)
+        atom_array -= np.mean(atom_array, axis=0)
+        return atom_array
+
+    def get_array_from_pybelmol(self, pybelmol):
+        atom_array = []
+        for atom in pybelmol.atoms:
+            coords = [atom.coords[0], atom.coords[1], atom.coords[2], np.sqrt(atom.atomicnum)]
+            if self.use_charges:
+                coords.append(atom.formalcharge)
+            atom_array.append(coords)
+        atom_array = np.array(atom_array)
+        atom_array -= np.mean(atom_array, axis=0)
+        return atom_array
+             
     def _initialize_from_smiles(self, smiles):
         if self.generator == 'ccdc':
             raise ValueError("CCDC generator does not support SMILES input directly.")
@@ -182,13 +193,13 @@ class HSR:
             ref_mol.addh()
             ref_mol.make3D()
             ref_mol.localopt()
-            ref_mol_array = get_array_from_pybelmol(ref_mol)
+            ref_mol_array = self.get_array_from_pybelmol(ref_mol)
         else:  # RDKit
             mol = Chem.MolFromSmiles(smiles)
             mol = Chem.AddHs(mol)
             Chem.AllChem.EmbedMolecule(mol)
             Chem.AllChem.MMFFOptimizeMolecule(mol)
-            ref_mol_array = pp.molecule_to_ndarray(mol, PROTON_FEATURES)
+            ref_mol_array = pp.molecule_to_ndarray(mol, self.feature_set)
         
         self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
     
@@ -198,19 +209,19 @@ class HSR:
         
         if self.generator == 'ccdc':
             ref_mol = component_of_interest(self.io.EntryReader('CSD').entry(csd_entry).molecule)
-            ref_mol_array = get_array_from_ccdcmol(ref_mol)
+            ref_mol_array = self.get_array_from_ccdcmol(ref_mol)
         elif self.generator == 'obabel':
             ref_mol = pb.readstring("smi", smiles)
             ref_mol.addh()
             ref_mol.make3D()
             ref_mol.localopt()
-            ref_mol_array = get_array_from_pybelmol(ref_mol)
+            ref_mol_array = self.get_array_from_pybelmol(ref_mol)
         else:  # RDKit
             mol = Chem.MolFromSmiles(smiles)
             mol = Chem.AddHs(mol)
             Chem.AllChem.EmbedMolecule(mol)
             Chem.AllChem.MMFFOptimizeMolecule(mol)
-            ref_mol_array = fp.generate_fingerprint_from_molecule(mol, PROTON_FEATURES)
+            ref_mol_array = fp.generate_fingerprint_from_molecule(mol, self.feature_set)
         
         self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
     
@@ -219,15 +230,15 @@ class HSR:
         
         if self.generator == 'ccdc':
             ref_mol = self.io.MoleculeReader(file_path)[0]
-            ref_mol_array = get_array_from_ccdcmol(ref_mol)
+            ref_mol_array = self.get_array_from_ccdcmol(ref_mol)
         elif self.generator == 'obabel':
             ref_mol = next(pb.readfile(ext[1:], file_path))
-            ref_mol_array = get_array_from_pybelmol(ref_mol)
+            ref_mol_array = self.get_array_from_pybelmol(ref_mol)
         else:  # RDKit
             ref_mol = pp.read_mol_from_file(file_path)
             if ref_mol is None:
                 raise ValueError("Invalid file format for RDKit parser.")
-            ref_mol_array = fp.generate_fingerprint_from_molecule(ref_mol, PROTON_FEATURES)
+            ref_mol_array = fp.generate_fingerprint_from_molecule(ref_mol, self.feature_set)
         
         self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
             
@@ -299,12 +310,12 @@ class HSR:
                     raise ValueError(f"Error generating 3D coordinates for {mol}")
                 result.update({f'3d_mol': mol_sdf})
                 if isinstance(molecule, pb.Molecule):
-                    mol_array = get_array_from_pybelmol(molecule)
+                    mol_array = self.get_array_from_pybelmol(molecule)
                     mol_fp = fp.generate_fingerprint_from_data(mol_array)
                 elif isinstance(molecule, Chem.Mol):
-                    mol_fp = fp.generate_fingerprint_from_molecule(molecule, PROTON_FEATURES)
+                    mol_fp = fp.generate_fingerprint_from_molecule(molecule, self.feature_set)
                 elif isinstance(molecule, self.ccdcMolecule):
-                    mol_array = get_array_from_ccdcmol(molecule)
+                    mol_array = self.get_array_from_ccdcmol(molecule)
                     mol_fp = fp.generate_fingerprint_from_data(mol_array)
                 
             #The molecule is a rdkit molecule (already in 3D)
@@ -316,13 +327,13 @@ class HSR:
                     raise Exception("Molecule is not 3D")
                 mol_sdf = Chem.MolToMolBlock(mol)
                 result.update({f'3d_mol': mol_sdf})
-                mol_fp = fp.generate_fingerprint_from_molecule(mol, PROTON_FEATURES)
+                mol_fp = fp.generate_fingerprint_from_molecule(mol, self.feature_set)
                 
             #The molecule is a pybel molecule (obabel)
             elif isinstance(mol, pb.Molecule):
                 result = {"molecule": mol}
                 result.update({f'3d_mol': mol.write("sdf")})
-                mol_array = get_array_from_pybelmol(mol)
+                mol_array = self.get_array_from_pybelmol(mol)
                 mol_fp = fp.generate_fingerprint_from_data(mol_array)
                 
             #The molecule is an np.array
@@ -334,7 +345,7 @@ class HSR:
             elif self.ccdcMolecule and isinstance(mol, self.ccdcMolecule):
                 result = {"molecule": mol}
                 mol_sdf = mol.to_string("sdf")
-                mol_array = get_array_from_ccdcmol(mol)
+                mol_array = self.get_array_from_ccdcmol(mol)
                 mol_fp = fp.generate_fingerprint_from_data(mol_array)
                 
         except Exception as e:
