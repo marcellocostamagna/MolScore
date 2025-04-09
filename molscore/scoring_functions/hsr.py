@@ -24,7 +24,36 @@ ch.setLevel(logging.INFO)
 logger.addHandler(ch)
 
 MOLSCORE_PATH = str(pkg_resources.files(molscore.configs))
+
+def component_of_interest(molecule):
+    components = molecule.components
+    properties = []
     
+    for comp in components:
+        is_organometallic = comp.is_organometallic
+        molecular_weight = sum(atom.atomic_weight for atom in comp.atoms)
+        atom_count = len(comp.atoms)
+        
+        properties.append({
+            "component": comp,
+            "is_organometallic": is_organometallic,
+            "molecular_weight": molecular_weight,
+            "atom_count": atom_count
+        })
+    
+    heaviest_component = max(properties, key=lambda x: x["molecular_weight"])
+    most_atoms_component = max(properties, key=lambda x: x["atom_count"])
+    
+    for prop in properties:
+        criteria_met = sum([
+            prop["is_organometallic"],
+            prop["component"] == heaviest_component["component"],
+            prop["component"] == most_atoms_component["component"]
+        ])
+        if criteria_met >= 2 and prop["atom_count"] >= 5:
+            return prop["component"]
+    return None
+
 def import_ccdc():
     """
     Safely imports required modules from the CCDC library, handles exceptions, and returns None if import fails.
@@ -56,7 +85,7 @@ def get_array_from_pybelmol(pybelmol):
     atom_array = []
     for atom in pybelmol.atoms:
         # Append the coordinates and the atomic number of the atom (on each row)
-        atom_array.append([atom.coords[0], atom.coords[1], atom.coords[2], atom.atomicnum])    
+        atom_array.append([atom.coords[0], atom.coords[1], atom.coords[2], np.sqrt(atom.atomicnum)])   
     # Centering the data
     atom_array -= np.mean(atom_array, axis=0)
     return atom_array
@@ -66,7 +95,7 @@ def get_array_from_ccdcmol(ccdcmol):
     atom_array = []
     for atom in ccdcmol.atoms:
         # Append the coordinates and the atomic number of the atom (on each row)
-        atom_array.append([atom.coordinates[0], atom.coordinates[1], atom.coordinates[2], atom.atomic_number])    
+        atom_array.append([atom.coordinates[0], atom.coordinates[1], atom.coordinates[2], np.sqrt(atom.atomic_number)])    
     # Centering the data
     atom_array -= np.mean(atom_array, axis=0)
     return atom_array
@@ -159,7 +188,7 @@ class HSR:
             mol = Chem.AddHs(mol)
             Chem.AllChem.EmbedMolecule(mol)
             Chem.AllChem.MMFFOptimizeMolecule(mol)
-            ref_mol_array = fp.generate_fingerprint_from_molecule(mol, PROTON_FEATURES)
+            ref_mol_array = pp.molecule_to_ndarray(mol, PROTON_FEATURES)
         
         self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
     
@@ -168,7 +197,7 @@ class HSR:
             csd_entry, smiles = f.readline().strip().split(":")
         
         if self.generator == 'ccdc':
-            ref_mol = self.io.MoleculeReader('CSD')[csd_entry]
+            ref_mol = component_of_interest(self.io.EntryReader('CSD').entry(csd_entry).molecule)
             ref_mol_array = get_array_from_ccdcmol(ref_mol)
         elif self.generator == 'obabel':
             ref_mol = pb.readstring("smi", smiles)
@@ -201,26 +230,6 @@ class HSR:
             ref_mol_array = fp.generate_fingerprint_from_molecule(ref_mol, PROTON_FEATURES)
         
         self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
-        
-        # if self.generator == 'ccdc':
-        #     self.io, self.conformer, self.ccdcMolecule = import_ccdc()
-        #     #Read molecule from file 
-        #     ref_mol = self.io.MoleculeReader(ref_molecule)[0]
-        #     ref_mol_array = get_array_from_ccdcmol(ref_mol)
-        #     self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
-        # elif self.generator == 'obabel':
-        #     #Read molecule from file (sdf)
-        #     ref_mol = next(pb.readfile("sdf", ref_molecule))
-        #     ref_mol_array = get_array_from_pybelmol(ref_mol)
-        #     self.ref_mol_fp = fp.generate_fingerprint_from_data(ref_mol_array)
-        # elif self.generator == 'rdkit' or self.generator == 'None':
-        #     self.ref_molecule = pp.read_mol_from_file(ref_molecule)
-        #     if self.ref_molecule is None:
-        #         raise ValueError("Reference molecule is None. Check if the extension of the file is managed by HSR")
-        #     self.ref_mol_fp = fp.generate_fingerprint_from_molecule(self.ref_molecule, PROTON_FEATURES)
-        # else:   
-        #     raise ValueError(f"Generator '{self.generator}' not supported. Please choose between 'rdkit', 'obabel', 'ccdc' or 'None'")
-            
             
     def save_mols_to_file(self, results: dict, directory: str, file_names: list):
         """
@@ -363,44 +372,54 @@ class HSR:
             os.path.abspath(directory), f"{self.prefix}_HSR", step
         )
         os.makedirs(directory, exist_ok=True)
-        # Prepare function for parallelization
         
-        pfunc = partial(self.score_mol,)
+        # Check if CCDC is available
+        ccdc_available = self.ccdcMolecule is not None
+        # Check if all molecules are CCDC **only if CCDC is available**
+        all_ccdc = ccdc_available and all(isinstance(mol, self.ccdcMolecule) for mol in molecules)
+                
+        results = []
         
-        # Score individual smiles
-        n_processes = min(self.n_jobs, len(molecules), os.cpu_count())
-        
-        with Pool(n_processes) as pool:
-        # try:
-            results = []
-            # Submit tasks with apply_async and set a timeout for each scoring
-            async_results = []
+        if all_ccdc:
+            logger.info("Processing CCDC molecules sequentially")
             for mol in molecules:
-                async_result = pool.apply_async(pfunc, args=(mol,))
-                async_results.append(async_result)
+                results.append(self.score_mol(mol))
+        else:    
+            # Prepare function for parallelization
+            pfunc = partial(self.score_mol,)
+            
+            # Score individual smiles
+            n_processes = min(self.n_jobs, len(molecules), os.cpu_count())
+            
+            with Pool(n_processes) as pool:
+                # Submit tasks with apply_async and set a timeout for each scoring
+                async_results = []
+                for mol in molecules:
+                    async_result = pool.apply_async(pfunc, args=(mol,))
+                    async_results.append(async_result)
 
-            # Collect results, applying timeout and handling it gracefully
-            for i, async_result in enumerate(async_results):
-                try:
-                    # Try to get the result with a timeout equal to the specified time limit
-                    result = async_result.get(timeout=self.timeout)
-                except multiprocessing.TimeoutError:
-                    # Handle the timeout scenario by using default values
-                    # logger.error(f"Timeout occurred for molecule: {molecules[i]}")
-                    result = {
-                        "molecule": molecules[i],
-                        f'3d_mol': 0.0,
-                        f'{self.prefix}_HSR_score': 0.0,
-                    }
-                except Exception as e:
-                    # Handle any other exception
-                    logger.error(f"Error processing molecule {molecules[i]}: {e}")
-                    result = {
-                        "molecule": molecules[i],
-                        f'3d_mol': 0.0,
-                        f'{self.prefix}_HSR_score': 0.0,
-                    }
-                results.append(result)
+                # Collect results, applying timeout and handling it gracefully
+                for i, async_result in enumerate(async_results):
+                    try:
+                        # Try to get the result with a timeout equal to the specified time limit
+                        result = async_result.get(timeout=self.timeout)
+                    except multiprocessing.TimeoutError:
+                        # Handle the timeout scenario by using default values
+                        # logger.error(f"Timeout occurred for molecule: {molecules[i]}")
+                        result = {
+                            "molecule": molecules[i],
+                            f'3d_mol': 0.0,
+                            f'{self.prefix}_HSR_score': 0.0,
+                        }
+                    except Exception as e:
+                        # Handle any other exception
+                        logger.error(f"Error processing molecule {molecules[i]}: {e}")
+                        result = {
+                            "molecule": molecules[i],
+                            f'3d_mol': 0.0,
+                            f'{self.prefix}_HSR_score': 0.0,
+                        }
+                    results.append(result)
 
         # Save mols
         # Check if in results there is the key '3d_mol' (we are not using ndarray, 

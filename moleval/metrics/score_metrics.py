@@ -60,7 +60,6 @@ class ScoreMetrics:
         unique=True,
         n_jobs=1,
         benchmark=None,
-        mols_in_3d=False,
     ):
         """This class facilitates the calculation of metrics (and benchmark metrics) 
         from the scores dataframe returned from MolScore. Additionally contains functions
@@ -79,7 +78,7 @@ class ScoreMetrics:
         self.total = len(scores)
         self.budget = budget if budget else self.total
         self.scores = self._preprocess_scores(
-            scores.copy(deep=True), valid=valid, unique=unique, budget=budget, mols_in_3d=mols_in_3d,
+            scores.copy(deep=True), valid=valid, unique=unique, budget=budget,
         )
         self.benchmark = benchmark
         
@@ -181,9 +180,9 @@ class ScoreMetrics:
         len_all = len(scores)
         
         # Truncate to valid only molecules and calculate valid ratio
-        if isinstance(scores.valid.dtype, np.dtypes.ObjectDType):
+        if np.issubdtype(scores.valid.dtype, np.object_):
             valid_value = "true" # Back compatability
-        elif isinstance(scores.valid.dtype, np.dtypes.BoolDType):
+        elif np.issubdtype(scores.valid.dtype, np.bool_):
             valid_value = True
         else:
             raise ValueError("Valid column has un unrecognised dtype")
@@ -195,9 +194,9 @@ class ScoreMetrics:
         len_valid = len(scores)
             
         # Truncate to unique only molecules and calculate unique ratio
-        if isinstance(scores.unique.dtype, np.dtypes.ObjectDType):
+        if np.issubdtype(scores.unique.dtype, np.object_):
             unique_value = "true" # Back compatability
-        elif isinstance(scores.unique.dtype, np.dtypes.BoolDType):
+        elif np.issubdtype(scores.unique.dtype, np.bool_):
             unique_value = True
         else:
             raise ValueError("Unique column has un unrecognised dtype")
